@@ -6,8 +6,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Streamlit setup
-st.set_page_config(page_title="NQL", layout="wide")
-st.title("🧪 nql")
+st.set_page_config(page_title="nql", layout="wide")
+st.title("🧪nql")
 st.markdown("Backtest & visualize volatility-based strategies on hourly oil data.")
 
 # Sidebar config
@@ -22,7 +22,10 @@ transaction_cost = 0.0002  # 2 basis points
 # Data fetching
 @st.cache_data
 def fetch_data(symbol, period):
-    return yf.download(tickers=symbol, period=period, interval="1h")
+    df = yf.download(tickers=symbol, period=period, interval="1h")
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(1)
+    return df
 
 data = fetch_data(symbol, period)
 
@@ -41,7 +44,6 @@ else:
     # Signal generation
     df['signal'] = ((df['hour'] == target_hour) & (df['volatility'] > vol_threshold)).astype(int)
     df['position'] = 0
-
     for i in range(len(df)):
         if df['signal'].iloc[i] == 1:
             end_idx = min(i + hold_hours, len(df) - 1)
@@ -50,8 +52,13 @@ else:
     # Strategy returns
     df['strategy_return'] = df['position'].shift(1) * df['return']
     df['strategy_return'] -= transaction_cost * df['position'].diff().abs().fillna(0)
-    df['cumulative_return'] = (1 + df['strategy_return']).cumprod()
-    df['buy_hold'] = (1 + df['return']).cumprod()
+    df['cumulative_return'] = (1 + df['strategy_return'].fillna(0)).cumprod()
+    df['buy_hold'] = (1 + df['return'].fillna(0)).cumprod()
+
+    # Plot strategy performance
+    st.subheader("📈 Strategy Performance")
+    plot_df = df[['cumulative_return', 'buy_hold']].dropna()
+    st.line_chart(plot_df)
 
     # Trade logging
     trades = []
@@ -66,15 +73,11 @@ else:
             open_trade['exit_time'] = df.index[i]
             open_trade['exit_price'] = df['Close'].iloc[i]
             open_trade['return'] = (open_trade['exit_price'] - open_trade['entry_price']) / open_trade['entry_price']
-            open_trade['holding_hours'] = (open_trade['exit_time'] - open_trade['entry_time']).seconds / 3600
+            open_trade['holding_hours'] = (df.index[i] - open_trade['entry_time']).seconds / 3600
             trades.append(open_trade)
             open_trade = None
 
     trades_df = pd.DataFrame(trades)
-
-    # Plotting
-    st.subheader("📈 Strategy Performance")
-    st.line_chart(df[['cumulative_return', 'buy_hold']])
 
     # Display sample trades
     st.subheader("📄 Sample Trades")
