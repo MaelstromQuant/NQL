@@ -19,12 +19,42 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS
-def local_css(file_name):
-    with open(file_name) as f:
-        st.markdown(f'<style>{f.read()}</style>', unsafe_allow_html=True)
+# Add custom CSS directly instead of loading from file
+def set_css():
+    st.markdown("""
+    <style>
+        /* Main menu */
+        .st-eb {
+            background-color: #f0f2f6 !important;
+        }
+        
+        /* Sidebar */
+        .css-1d391kg {
+            background-color: #f8f9fa !important;
+        }
+        
+        /* Metrics */
+        .st-bh, .st-cg, .st-ci {
+            background-color: #ffffff !important;
+            border-radius: 8px;
+            padding: 15px !important;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        /* Titles */
+        h1, h2, h3 {
+            color: #1e3a8a;
+        }
+        
+        /* Dataframes */
+        .dataframe {
+            border-radius: 8px;
+        }
+    </style>
+    """, unsafe_allow_html=True)
 
-local_css("style.css")
+set_css()
+
 
 # === CONFIGURATION ===
 class Config:
