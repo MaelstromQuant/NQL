@@ -1,756 +1,700 @@
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import yfinance as yf
 import matplotlib.pyplot as plt
-import seaborn as sns
+import requests
 from datetime import datetime, timedelta
-import warnings
-from scipy.stats import linregress
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from stable_baselines3 import DQN, PPO
+from stable_baselines3.common.env_util import make_vec_env
+from gym import Env, spaces
+import time
+import pytz
+from collections import deque
+import plotly.graph_objects as go
 
-# Suppress warnings
-warnings.filterwarnings('ignore')
-
-# Set page config
-st.set_page_config(
-    page_title="Trading Strategy Dashboard",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Custom CSS styling
-def set_css():
-    st.markdown("""
-    <style>
-        /* Main container */
-        .main {
-            background-color: #f8f9fa;
-        }
-        
-        /* Sidebar */
-        .css-1d391kg {
-            background-color: #e9ecef;
-            padding: 1rem;
-            border-radius: 0.5rem;
-        }
-        
-        /* Metrics cards */
-        .st-bh, .st-cg, .st-ci {
-            background-color: white;
-            border-radius: 0.5rem;
-            padding: 1rem;
-            box-shadow: 0 0.125rem 0.25rem rgba(0,0,0,0.1);
-        }
-        
-        /* Titles */
-        h1, h2, h3 {
-            color: #1e3a8a;
-        }
-        
-        /* Dataframes */
-        .dataframe {
-            border-radius: 0.5rem;
-            box-shadow: 0 0.125rem 0.25rem rgba(0,0,0,0.1);
-        }
-        
-        /* Buttons */
-        .stButton>button {
-            background-color: #4a6bdf;
-            color: white;
-            border-radius: 0.5rem;
-            padding: 0.5rem 1rem;
-        }
-    </style>
-    """, unsafe_allow_html=True)
-
-set_css()
-
-# === CONFIGURATION ===
+# Configuration
 class Config:
-    DEFAULT_HOLD_HOURS = 3
-    DEFAULT_TRANSACTION_COST = 0.0002  # 2 basis points
-    DEFAULT_VOL_THRESHOLDS = [0.1, 0.2, 0.3, 0.4, 0.5]
-    DEFAULT_HOURS_TO_TEST = list(range(0, 24))
-    DEFAULT_SYMBOL = 'CL=F'  # WTI Crude Oil
-    DEFAULT_PERIOD = '180d'
-    DEFAULT_INTERVAL = '1h'
-    RISK_FREE_RATE = 0.0  # For Sharpe ratio calculation
-    
-    # Exchange session hour ranges in UTC
-    SESSION_RANGES = {
-        'Asia': range(0, 6),      # Tokyo/Singapore/HongKong
-        'Europe': range(7, 16),   # London/Frankfurt overlap
-        'US': range(13, 21),      # New York
-        'Electronic': list(range(21, 24)) + list(range(0, 1))  # Overnight electronic
-    }
+    DEFAULT_TICKER = "CL=F"  # WTI Crude Oil Futures
+    DEFAULT_PERIOD = "6mo"
+    DEFAULT_INTERVAL = "1h"
+    VOL_THRESH = 0.0025  # Default volatility threshold
+    HOLD_HOURS = 6  # Default hold period for trades
+    TRANSACTION_COST = 0.0005  # 0.05% transaction cost
+    NEWS_UPDATE_MINUTES = 15  # Update news every 15 minutes
+    EIA_UPDATE_HOURS = 24  # Update inventory data every 24 hours
 
-# === DATA HANDLING ===
+# Data Handler
 class DataHandler:
     @staticmethod
-    @st.cache_data(ttl=3600, show_spinner="Fetching market data...")
-    def fetch_data(symbol, period, interval):
-        """Fetch data with error handling and caching"""
+    def fetch_data(ticker, period, interval):
+        """Fetch price data from Yahoo Finance"""
         try:
-            data = yf.download(tickers=symbol, period=period, interval=interval, progress=False)
+            data = yf.download(tickers=ticker, period=period, interval=interval)
             if data.empty:
-                st.error("No data returned from Yahoo Finance")
+                st.error("No data returned. Please check your parameters.")
                 return None
-            return data.dropna()
+            return data
         except Exception as e:
             st.error(f"Error fetching data: {e}")
             return None
 
     @staticmethod
     def add_features(df):
-        """Enhanced feature engineering"""
+        """Add technical features to the dataframe"""
         if df is None or df.empty:
-            return None
+            return df
             
         df = df.copy()
         
-        # Basic features
+        # Calculate returns
         df['return'] = df['Close'].pct_change()
-        df['hour'] = df.index.hour
-        df['date'] = df.index.date
         
-        # Volatility measures
-        df['volatility_3h'] = df['Close'].rolling(window=3).std()
-        df['volatility_12h'] = df['Close'].rolling(window=12).std()
-        df['volatility_ratio'] = df['volatility_3h'] / df['volatility_12h'].replace(0, np.nan)
+        # Calculate volatility (std of returns)
+        df['volatility_3h'] = df['return'].rolling(3).std()
+        df['volatility_12h'] = df['return'].rolling(12).std()
+        df['volatility_ratio'] = df['volatility_3h'] / df['volatility_12h']
         
-        # Momentum indicators
+        # Calculate momentum
         df['momentum_3h'] = df['Close'].pct_change(3)
         df['momentum_12h'] = df['Close'].pct_change(12)
         
-        # Session features
-        df = DataHandler.label_sessions(df)
-        
-        return df.dropna()
-
-    @staticmethod
-    def label_sessions(df):
-        """Label trading sessions with overlap handling"""
-        if df is None or df.empty:
-            return None
-            
-        df = df.copy()
+        # Add session labels (Asia, Europe, US)
+        df['hour'] = df.index.hour
         df['session'] = 'Other'
-        
-        for name, hours in Config.SESSION_RANGES.items():
-            mask = df['hour'].isin(hours)
-            df.loc[mask, 'session'] = name
-        
-        # Handle overlapping sessions
-        overlap_mask = (df['hour'] >= 13) & (df['hour'] < 16)  # London/NY overlap
-        df.loc[overlap_mask, 'session'] = 'London/NY Overlap'
+        df.loc[(df['hour'] >= 0) & (df['hour'] < 8), 'session'] = 'Asia'
+        df.loc[(df['hour'] >= 8) & (df['hour'] < 16), 'session'] = 'Europe'
+        df.loc[(df['hour'] >= 16) & (df['hour'] < 24), 'session'] = 'US'
         
         return df
 
-# === STRATEGY LOGIC ===
+# News Handler
+class NewsHandler:
+    def __init__(self, api_key=None):
+        self.api_key = api_key
+        self.analyzer = SentimentIntensityAnalyzer()
+        self.last_update = None
+        self.cached_sentiment = 0
+        self.cached_news = []
+        
+    def fetch_latest_headlines(self, query="crude oil OR WTI", page_size=10):
+        """Fetch news headlines from NewsAPI"""
+        if not self.api_key:
+            return []
+            
+        try:
+            url = f"https://newsapi.org/v2/everything?q={query}&pageSize={page_size}&sortBy=publishedAt&apiKey={self.api_key}"
+            response = requests.get(url)
+            data = response.json()
+            articles = data.get('articles', [])
+            return articles
+        except Exception as e:
+            st.error(f"Error fetching news: {e}")
+            return []
+    
+    def update_news_sentiment(self):
+        """Update news sentiment if enough time has passed"""
+        if not self.api_key:
+            return 0
+            
+        now = datetime.now()
+        if (self.last_update is None or 
+            (now - self.last_update).total_seconds() > Config.NEWS_UPDATE_MINUTES * 60):
+            
+            articles = self.fetch_latest_headlines()
+            if articles:
+                self.cached_news = articles
+                scores = [self.analyzer.polarity_scores(article['title'])['compound'] 
+                         for article in articles if article.get('title')]
+                if scores:
+                    self.cached_sentiment = np.mean(scores)
+                self.last_update = now
+                
+        return self.cached_sentiment
+
+# Economic Data Handler
+class EconDataHandler:
+    def __init__(self, api_key=None):
+        self.api_key = api_key
+        self.last_update = None
+        self.cached_inventory = None
+        
+    def fetch_latest_inventory(self):
+        """Fetch latest crude oil inventory data from EIA"""
+        if not self.api_key:
+            return None
+            
+        try:
+            url = f"https://api.eia.gov/v2/petroleum/stoc/wstk/data/?api_key={self.api_key}&frequency=weekly&data[0]=value&sort[0][column]=period&sort[0][direction]=desc&offset=0&length=1"
+            response = requests.get(url)
+            data = response.json()
+            if 'data' in data and len(data['data']) > 0:
+                return data['data'][0]['value']
+            return None
+        except Exception as e:
+            st.error(f"Error fetching inventory data: {e}")
+            return None
+    
+    def update_inventory_data(self):
+        """Update inventory data if enough time has passed"""
+        if not self.api_key:
+            return None
+            
+        now = datetime.now()
+        if (self.last_update is None or 
+            (now - self.last_update).total_seconds() > Config.EIA_UPDATE_HOURS * 3600):
+            
+            inventory = self.fetch_latest_inventory()
+            if inventory is not None:
+                self.cached_inventory = inventory
+                self.last_update = now
+                
+        return self.cached_inventory
+
+# Trading Strategy
 class TradingStrategy:
     @staticmethod
-    def generate_signals(df, target_hour, vol_thresh, hold_hours):
-        """Enhanced signal generation with multiple conditions"""
+    def generate_signals(df, vol_thresh, hold_hours, use_sentiment=False, sentiment_threshold=-0.5):
+        """Generate trading signals based on volatility and optional sentiment"""
         if df is None or df.empty:
             return None
             
         df = df.copy()
-        
-        # Initialize signals
         df['signal'] = 0
         
-        # Entry conditions
-        entry_condition = (
+        # Base condition: volatility spike during target hour
+        target_hour = 10  # 10 AM (can be parameterized)
+        base_condition = (
             (df['hour'] == target_hour) & 
             (df['volatility_3h'] > vol_thresh) & 
-            (df['volatility_ratio'] > 0.7)  # Recent volatility is significant
+            (df['volatility_ratio'] > 0.7
         )
         
+        # Optional sentiment filter
+        if use_sentiment and 'news_sentiment' in df:
+            sentiment_condition = (df['news_sentiment'] > sentiment_threshold)
+            entry_condition = base_condition & sentiment_condition
+        else:
+            entry_condition = base_condition
+        
+        # Generate signals
         df.loc[entry_condition, 'signal'] = 1
         
-        # Position management
-        df['position'] = 0
-        active_positions = 0
+        # Implement hold period
+        for i in df[df['signal'] == 1].index:
+            end_idx = min(len(df), df.index.get_loc(i) + hold_hours)
+            df.loc[i:df.index[end_idx-1], 'position'] = 1
         
-        for i in range(1, len(df)):
-            if df['signal'].iloc[i] == 1 and active_positions == 0:
-                # Enter position
-                end_idx = min(i + hold_hours, len(df) - 1)
-                df.iloc[i:end_idx+1, df.columns.get_loc('position')] = 1
-                active_positions = 1
-            elif active_positions > 0 and df['position'].iloc[i-1] == 1 and df['position'].iloc[i] == 0:
-                # Position naturally expired
-                active_positions = 0
+        # Fill remaining positions with 0
+        df['position'] = df['position'].fillna(0)
         
         return df
 
-# === BACKTESTING ===
+# Backtester
 class Backtester:
     @staticmethod
-    def run_backtest(df, transaction_cost):
-        """Comprehensive backtesting with enhanced metrics"""
-        if df is None or df.empty:
-            return None, pd.DataFrame(), {
-                'total_return': 0,
-                'annualized_return': 0,
-                'sharpe_ratio': 0,
-                'sortino_ratio': 0,
-                'max_drawdown': 0,
-                'win_rate': 0,
-                'profit_factor': 0,
-                'avg_trade_return': 0,
-                'trades': 0
-            }
+    def run_backtest(df, transaction_cost=0.0005):
+        """Run backtest on strategy"""
+        if df is None or 'position' not in df:
+            return None
             
         df = df.copy()
         
         # Calculate strategy returns
         df['strategy_return'] = df['position'].shift(1) * df['return']
-        df['strategy_return'] -= transaction_cost * df['position'].diff().abs().fillna(0)
         
-        # Cumulative returns
+        # Apply transaction costs
+        trade_dates = df[df['position'].diff() != 0].index
+        df.loc[trade_dates, 'strategy_return'] -= transaction_cost
+        
+        # Calculate cumulative returns
         df['cumulative_return'] = (1 + df['strategy_return']).cumprod()
-        df['buy_hold'] = (1 + df['return']).cumprod()
+        df['benchmark_return'] = (1 + df['return']).cumprod()
         
-        # Trade logging
-        trades = Backtester._log_trades(df)
-        trades_df = pd.DataFrame(trades) if trades else pd.DataFrame()
-        
-        # Performance metrics
-        metrics = Backtester._calculate_metrics(df, trades_df, transaction_cost)
-        
-        return df, trades_df, metrics
-
+        return df
+    
     @staticmethod
-    def _log_trades(df):
-        """Detailed trade logging with robust return calculation"""
-        if df is None or df.empty:
-            return []
+    def calculate_metrics(df):
+        """Calculate performance metrics"""
+        if df is None or 'strategy_return' not in df:
+            return {}
             
-        trades = []
-        open_trade = None
+        metrics = {}
         
-        for i in range(1, len(df)):
-            # Entry
-            if df['position'].iloc[i-1] == 0 and df['position'].iloc[i] == 1:
-                open_trade = {
-                    'entry_time': df.index[i],
-                    'entry_price': df['Close'].iloc[i],
-                    'entry_session': df['session'].iloc[i],
-                    'entry_volatility': df['volatility_3h'].iloc[i]
-                }
-            # Exit
-            elif df['position'].iloc[i-1] == 1 and df['position'].iloc[i] == 0 and open_trade:
-                try:
-                    entry_price = float(open_trade['entry_price'])
-                    exit_price = float(df['Close'].iloc[i])
-                    
-                    if entry_price == 0:
-                        continue  # Skip invalid trades
-                        
-                    raw_return = (exit_price - entry_price) / entry_price
-                    net_return = raw_return - 2*Config.DEFAULT_TRANSACTION_COST
-                    
-                    open_trade.update({
-                        'exit_time': df.index[i],
-                        'exit_price': exit_price,
-                        'exit_session': df['session'].iloc[i],
-                        'holding_period': (df.index[i] - open_trade['entry_time']).total_seconds() / 3600,
-                        'return': raw_return,
-                        'return_net': net_return if not np.isnan(net_return) else 0.0
-                    })
-                    trades.append(open_trade)
-                except (TypeError, ValueError, KeyError):
-                    continue
-                finally:
-                    open_trade = None
+        # Total returns
+        metrics['strategy_return'] = df['cumulative_return'].iloc[-1] - 1
+        metrics['benchmark_return'] = df['benchmark_return'].iloc[-1] - 1
         
-        return trades
+        # Annualized returns
+        days = (df.index[-1] - df.index[0]).days
+        metrics['annualized_strategy'] = (1 + metrics['strategy_return'])**(365/days) - 1
+        metrics['annualized_benchmark'] = (1 + metrics['benchmark_return'])**(365/days) - 1
+        
+        # Volatility
+        metrics['strategy_volatility'] = df['strategy_return'].std() * np.sqrt(252)
+        metrics['benchmark_volatility'] = df['return'].std() * np.sqrt(252)
+        
+        # Sharpe ratio (assuming risk-free rate = 0)
+        metrics['sharpe_ratio'] = metrics['annualized_strategy'] / metrics['strategy_volatility']
+        
+        # Max drawdown
+        cum_returns = df['cumulative_return']
+        peak = cum_returns.cummax()
+        drawdown = (cum_returns - peak) / peak
+        metrics['max_drawdown'] = drawdown.min()
+        
+        # Win rate
+        wins = df[df['strategy_return'] > 0]['strategy_return'].count()
+        trades = df[df['strategy_return'] != 0]['strategy_return'].count()
+        metrics['win_rate'] = wins / trades if trades > 0 else 0
+        
+        return metrics
 
-    @staticmethod
-    def _calculate_metrics(df, trades_df, transaction_cost):
-        """Enhanced performance metrics with robust error handling"""
-        if df is None or df.empty or len(trades_df) == 0:
-            return {
-                'total_return': 0,
-                'annualized_return': 0,
-                'sharpe_ratio': 0,
-                'sortino_ratio': 0,
-                'max_drawdown': 0,
-                'win_rate': 0,
-                'profit_factor': 0,
-                'avg_trade_return': 0,
-                'trades': 0
-            }
+# RL Trading Environment
+class OilTradingEnv(Env):
+    def __init__(self, df, initial_balance=100000, transaction_cost=0.0005):
+        super().__init__()
+        self.df = df
+        self.current_step = 0
+        self.initial_balance = initial_balance
+        self.transaction_cost = transaction_cost
+        
+        # State space: past returns, volatility, momentum, sentiment, inventory
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, 
+            shape=(15,), dtype=np.float32
+        )
+        
+        # Action space: 0=hold, 1=buy, 2=sell
+        self.action_space = spaces.Discrete(3)
+        
+        self.reset()
+    
+    def reset(self):
+        self.balance = self.initial_balance
+        self.position = 0
+        self.entry_price = 0
+        self.current_step = 10  # Start with enough history
+        self.trades = []
+        
+        return self._get_state()
+    
+    def _get_state(self):
+        """Get current state vector"""
+        # Past 10 returns
+        returns = self.df['return'].iloc[self.current_step-10:self.current_step].values
+        
+        # Current features
+        features = [
+            self.df['volatility_3h'].iloc[self.current_step],
+            self.df['volatility_ratio'].iloc[self.current_step],
+            self.df['momentum_3h'].iloc[self.current_step],
+            self.df['momentum_12h'].iloc[self.current_step],
+            self.df.get('news_sentiment', 0).iloc[self.current_step],
+            self.df.get('inventory_level', 0).iloc[self.current_step],
+            self.position
+        ]
+        
+        state = np.concatenate([returns, features]).astype(np.float32)
+        return state
+    
+    def step(self, action):
+        """Execute one step in the environment"""
+        if self.current_step >= len(self.df) - 1:
+            return self._get_state(), 0, True, {}
             
-        try:
-            # Basic metrics
-            total_return = float(df['cumulative_return'].iloc[-1]) - 1
-            annualized_return = (1 + total_return) ** (365/(len(df)/24)) - 1
-            
-            # Risk-adjusted metrics
-            excess_returns = df['strategy_return'] - Config.RISK_FREE_RATE/24
-            excess_returns = excess_returns.replace([np.inf, -np.inf], np.nan).dropna()
-            
-            if len(excess_returns) == 0:
-                sharpe = 0
-            else:
-                sharpe = excess_returns.mean() / excess_returns.std() * np.sqrt(24) if excess_returns.std() != 0 else 0
-            
-            downside_returns = excess_returns[excess_returns < 0]
-            sortino = excess_returns.mean() / downside_returns.std() * np.sqrt(24) if len(downside_returns) > 0 else 0
-            
-            # Drawdown
-            cum_returns = df['cumulative_return']
-            max_dd = (cum_returns / cum_returns.cummax() - 1).min()
-            
-            # Trade metrics
-            valid_returns = trades_df['return_net'].replace([np.inf, -np.inf], np.nan).dropna()
-            winning_trades = valid_returns[valid_returns > 0]
-            losing_trades = valid_returns[valid_returns < 0]
-            
-            win_rate = len(winning_trades) / len(valid_returns) if len(valid_returns) > 0 else 0
-            profit_factor = winning_trades.sum() / abs(losing_trades.sum()) if len(losing_trades) > 0 else np.inf
-            avg_trade_return = valid_returns.mean() if len(valid_returns) > 0 else 0
-            
-            return {
-                'total_return': total_return,
-                'annualized_return': annualized_return,
-                'sharpe_ratio': sharpe,
-                'sortino_ratio': sortino,
-                'max_drawdown': max_dd,
-                'win_rate': win_rate,
-                'profit_factor': profit_factor,
-                'avg_trade_return': avg_trade_return,
-                'trades': len(trades_df)
-            }
-        except Exception as e:
-            st.error(f"Error calculating metrics: {str(e)}")
-            return {
-                'total_return': 0,
-                'annualized_return': 0,
-                'sharpe_ratio': 0,
-                'sortino_ratio': 0,
-                'max_drawdown': 0,
-                'win_rate': 0,
-                'profit_factor': 0,
-                'avg_trade_return': 0,
-                'trades': 0
-            }
-
-# === OPTIMIZATION ===
-class Optimizer:
-    @staticmethod
-    def grid_search(raw_data, params):
-        """Perform parameter optimization with walk-forward validation"""
-        if raw_data is None or raw_data.empty:
-            return pd.DataFrame()
-            
-        try:
-            results = []
-            
-            # Split data into training and validation sets
-            split_idx = int(len(raw_data) * 0.7)
-            train_data = raw_data.iloc[:split_idx]
-            valid_data = raw_data.iloc[split_idx:]
-            
-            # Parameter grid
-            param_grid = {
-                'hour': params['hours_to_test'],
-                'vol_thresh': params['vol_thresholds'],
-                'hold_hours': params['hold_hours']
-            }
-            
-            # Train phase
-            train_results = []
-            for hour in param_grid['hour']:
-                for vol in param_grid['vol_thresh']:
-                    for hold in param_grid['hold_hours']:
-                        df = DataHandler.add_features(train_data.copy())
-                        if df is None:
-                            continue
-                            
-                        df = TradingStrategy.generate_signals(df, hour, vol, hold)
-                        if df is None:
-                            continue
-                            
-                        _, _, metrics = Backtester.run_backtest(df, params['transaction_cost'])
-                        
-                        train_results.append({
-                            'hour': hour,
-                            'vol_thresh': vol,
-                            'hold_hours': hold,
-                            'train_sharpe': metrics['sharpe_ratio'],
-                            'train_return': metrics['total_return']
-                        })
-            
-            # Get top N configurations from training
-            train_df = pd.DataFrame(train_results)
-            if train_df.empty:
-                return pd.DataFrame()
-                
-            top_configs = train_df.sort_values('train_sharpe', ascending=False).head(10)
-            
-            # Validate top configurations
-            for _, config in top_configs.iterrows():
-                df = DataHandler.add_features(valid_data.copy())
-                if df is None:
-                    continue
-                    
-                df = TradingStrategy.generate_signals(df, config['hour'], config['vol_thresh'], config['hold_hours'])
-                if df is None:
-                    continue
-                    
-                _, _, metrics = Backtester.run_backtest(df, params['transaction_cost'])
-                
-                results.append({
-                    'hour': config['hour'],
-                    'vol_thresh': config['vol_thresh'],
-                    'hold_hours': config['hold_hours'],
-                    'train_sharpe': config['train_sharpe'],
-                    'train_return': config['train_return'],
-                    'valid_sharpe': metrics['sharpe_ratio'],
-                    'valid_return': metrics['total_return'],
-                    'combined_sharpe': (config['train_sharpe'] + metrics['sharpe_ratio'])/2
+        current_price = self.df['Close'].iloc[self.current_step]
+        reward = 0
+        info = {}
+        
+        # Execute action
+        if action == 1:  # Buy
+            if self.position == 0:
+                self.position = 1
+                self.entry_price = current_price
+                self.balance -= self.transaction_cost * self.balance
+                info['action'] = 'buy'
+        elif action == 2:  # Sell
+            if self.position == 1:
+                # Calculate profit
+                profit = (current_price - self.entry_price) / self.entry_price
+                reward = profit * 100  # Scale reward
+                self.balance *= (1 + profit - self.transaction_cost)
+                self.position = 0
+                info['action'] = 'sell'
+                self.trades.append({
+                    'entry': self.entry_price,
+                    'exit': current_price,
+                    'profit': profit,
+                    'step': self.current_step
                 })
-            
-            results_df = pd.DataFrame(results)
-            return results_df.sort_values('combined_sharpe', ascending=False)
-            
-        except Exception as e:
-            st.error(f"Error during optimization: {str(e)}")
-            return pd.DataFrame()
+        
+        # Move to next step
+        self.current_step += 1
+        
+        # Check if done
+        done = self.current_step >= len(self.df) - 1
+        
+        # Get new state
+        next_state = self._get_state()
+        
+        return next_state, reward, done, info
+    
+    def render(self, mode='human'):
+        """Render environment state"""
+        if mode == 'human':
+            print(f"Step: {self.current_step}, Balance: {self.balance:.2f}, Position: {self.position}")
 
-# === VISUALIZATION ===
-class Visualizer:
-    @staticmethod
-    def plot_equity_curve(df, config):
-        """Plot equity curve with annotations"""
-        if df is None or df.empty:
+# RL Agent Trainer
+class RLTrainer:
+    def __init__(self):
+        self.model = None
+        self.training = False
+        self.progress = 0
+    
+    def train_model(self, df, total_timesteps=10000, algorithm='DQN'):
+        """Train RL model on given data"""
+        if df is None or len(df) < 100:
+            st.error("Not enough data for training")
             return None
             
-        fig, ax = plt.subplots(figsize=(12, 6))
+        self.training = True
+        self.progress = 0
         
-        # Plot equity curves
-        ax.plot(df.index, df['cumulative_return'], 
-                label=f"Strategy (hour={config['hour']}, vol>{config['vol_thresh']:.2f}, hold={config['hold_hours']}h)")
-        ax.plot(df.index, df['buy_hold'], label='Buy & Hold', alpha=0.7)
+        # Create environment
+        env = OilTradingEnv(df)
         
-        # Add annotations
-        ax.set_title('Strategy Performance', fontsize=14)
-        ax.set_ylabel('Cumulative Return', fontsize=12)
-        ax.grid(True, linestyle='--', alpha=0.7)
-        ax.legend(fontsize=12)
+        # Create model
+        if algorithm == 'DQN':
+            model = DQN('MlpPolicy', env, verbose=0)
+        else:
+            model = PPO('MlpPolicy', env, verbose=0)
         
-        # Formatting
-        plt.xticks(fontsize=10)
-        plt.yticks(fontsize=10)
-        plt.tight_layout()
-        
-        return fig
-
-    @staticmethod
-    def plot_drawdown(df):
-        """Plot drawdown curve"""
-        if df is None or df.empty:
+        # Train in chunks to update progress
+        chunk_size = total_timesteps // 10
+        for i in range(10):
+            model.learn(chunk_size, reset_num_timesteps=False)
+            self.progress = (i + 1) * 10
+            time.sleep(0.1)  # Simulate training time
+            
+        self.training = False
+        return model
+    
+    def evaluate_model(self, model, df):
+        """Evaluate trained model on data"""
+        if model is None or df is None:
             return None
             
-        fig, ax = plt.subplots(figsize=(12, 4))
+        env = OilTradingEnv(df)
+        obs = env.reset()
+        done = False
+        portfolio_values = [env.balance]
         
-        # Calculate drawdown
-        dd = (df['cumulative_return'] / df['cumulative_return'].cummax() - 1)
+        while not done:
+            action, _ = model.predict(obs)
+            obs, reward, done, info = env.step(action)
+            portfolio_values.append(env.balance)
         
-        # Plot
-        ax.fill_between(df.index, dd, 0, color='red', alpha=0.3)
-        ax.set_title('Drawdown', fontsize=14)
-        ax.set_ylabel('Drawdown', fontsize=12)
-        ax.grid(True, linestyle='--', alpha=0.7)
-        
-        # Formatting
-        plt.xticks(fontsize=10)
-        plt.yticks(fontsize=10)
-        plt.tight_layout()
-        
-        return fig
+        return {
+            'portfolio': portfolio_values,
+            'trades': env.trades,
+            'final_balance': env.balance,
+            'return': (env.balance - env.initial_balance) / env.initial_balance
+        }
 
-    @staticmethod
-    def plot_trade_analysis(trades_df):
-        """Plot trade-level analysis"""
-        if trades_df is None or trades_df.empty:
-            return None
-            
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
-        
-        # Trade returns distribution
-        sns.histplot(trades_df['return_net'].replace([np.inf, -np.inf], np.nan).dropna(), 
-                    bins=30, kde=True, ax=ax1)
-        ax1.set_title('Distribution of Trade Returns', fontsize=14)
-        ax1.set_xlabel('Return', fontsize=12)
-        ax1.grid(True, linestyle='--', alpha=0.7)
-        
-        # Returns by hour
-        trades_df['entry_hour'] = trades_df['entry_time'].dt.hour
-        hourly_returns = trades_df.groupby('entry_hour')['return_net'].mean()
-        hourly_returns.plot(kind='bar', color='blue', alpha=0.6, ax=ax2)
-        ax2.set_title('Average Returns by Entry Hour', fontsize=14)
-        ax2.set_xlabel('Hour (UTC)', fontsize=12)
-        ax2.set_ylabel('Average Return', fontsize=12)
-        ax2.grid(True, linestyle='--', alpha=0.7)
-        
-        plt.tight_layout()
-        return fig
-
-    @staticmethod
-    def plot_session_returns(trades_df):
-        """Plot returns by trading session"""
-        if trades_df is None or trades_df.empty:
-            return None
-            
-        fig, ax = plt.subplots(figsize=(10, 6))
-        
-        session_returns = trades_df.groupby('entry_session')['return_net'] \
-                                 .mean() \
-                                 .sort_values()
-        session_returns.plot(kind='barh', color='green', alpha=0.6, ax=ax)
-        
-        ax.set_title('Average Returns by Trading Session', fontsize=14)
-        ax.set_xlabel('Average Return', fontsize=12)
-        ax.grid(True, linestyle='--', alpha=0.7)
-        
-        plt.tight_layout()
-        return fig
-
-# === STREAMLIT UI ===
+# Streamlit App
 def main():
-    st.title("📈 Volatility-Based Trading Strategy Dashboard")
+    st.set_page_config(
+        page_title="Crude Oil Trading Dashboard",
+        page_icon="🛢️",
+        layout="wide"
+    )
+    
+    st.title("🛢️ Crude Oil Trading Dashboard")
     st.markdown("""
-    This dashboard backtests a time-based trading strategy that enters positions at specific hours 
-    when volatility exceeds a threshold. The strategy holds positions for a fixed number of hours.
+    A reinforcement learning-powered dashboard for trading WTI Crude Oil futures.
+    Combines technical indicators, news sentiment, and inventory data.
     """)
     
-    # Sidebar configuration
-    st.sidebar.header("Strategy Configuration")
+    # Initialize session state
+    if 'raw_data' not in st.session_state:
+        st.session_state.raw_data = None
+    if 'processed_data' not in st.session_state:
+        st.session_state.processed_data = None
+    if 'backtest_data' not in st.session_state:
+        st.session_state.backtest_data = None
+    if 'rl_model' not in st.session_state:
+        st.session_state.rl_model = None
+    if 'rl_results' not in st.session_state:
+        st.session_state.rl_results = None
     
-    # Asset selection
-    symbol = st.sidebar.text_input("Ticker Symbol", Config.DEFAULT_SYMBOL)
-    period = st.sidebar.selectbox(
-        "Data Period", 
-        ['30d', '60d', '90d', '180d', '1y', '2y'], 
+    # Sidebar configuration
+    st.sidebar.header("Configuration")
+    
+    # API keys
+    st.sidebar.subheader("API Keys")
+    news_api_key = st.sidebar.text_input("NewsAPI Key", type="password")
+    eia_api_key = st.sidebar.text_input("EIA API Key", type="password")
+    
+    # Data parameters
+    st.sidebar.subheader("Data Parameters")
+    ticker = st.sidebar.text_input("Ticker Symbol", Config.DEFAULT_TICKER)
+    interval = st.sidebar.selectbox(
+        "Interval",
+        ['5m', '15m', '30m', '1h', '2h', '4h', '1d'],
         index=3
     )
-    interval = st.sidebar.selectbox(
-        "Interval", 
-        ['1h', '2h', '4h', '1d'], 
-        index=0
-    )
+    
+    # Adjust period based on interval
+    if interval in ['5m', '15m']:
+        period_options = ['1d', '5d', '1mo', '3mo']
+    else:
+        period_options = ['1d', '5d', '1mo', '3mo', '6mo', '1y', '2y']
+    
+    period = st.sidebar.selectbox("Period", period_options, index=3)
     
     # Strategy parameters
     st.sidebar.subheader("Strategy Parameters")
-    default_hours = st.sidebar.multiselect(
-        "Hours to Test (UTC)", 
-        Config.DEFAULT_HOURS_TO_TEST, 
-        default=[8, 13, 16]
+    vol_thresh = st.sidebar.number_input(
+        "Volatility Threshold", 
+        min_value=0.0001, 
+        max_value=0.1, 
+        value=Config.VOL_THRESH,
+        step=0.0001,
+        format="%.4f"
     )
-    vol_thresholds = st.sidebar.multiselect(
-        "Volatility Thresholds", 
-        Config.DEFAULT_VOL_THRESHOLDS, 
-        default=[0.2, 0.3, 0.4]
+    hold_hours = st.sidebar.number_input(
+        "Hold Hours", 
+        min_value=1, 
+        max_value=24, 
+        value=Config.HOLD_HOURS
     )
-    hold_hours = st.sidebar.multiselect(
-        "Holding Periods (hours)", 
-        [1, 2, 3, 4, 6, 8, 12], 
-        default=[2, 3, 4]
-    )
-    transaction_cost = st.sidebar.number_input(
-        "Transaction Cost (%)", 
-        min_value=0.0, 
+    use_sentiment = st.sidebar.checkbox("Use News Sentiment Filter", value=True)
+    sentiment_threshold = st.sidebar.slider(
+        "Sentiment Threshold", 
+        min_value=-1.0, 
         max_value=1.0, 
-        value=Config.DEFAULT_TRANSACTION_COST*100, 
-        step=0.01
-    ) / 100
+        value=-0.5, 
+        step=0.1
+    )
     
-    # Manual backtest options
-    st.sidebar.subheader("Manual Backtest")
-    manual_hour = st.sidebar.selectbox("Entry Hour (UTC)", Config.DEFAULT_HOURS_TO_TEST, index=8)
-    manual_vol = st.sidebar.selectbox("Volatility Threshold", Config.DEFAULT_VOL_THRESHOLDS, index=2)
-    manual_hold = st.sidebar.selectbox("Holding Hours", [1, 2, 3, 4, 6, 8, 12], index=2)
+    # Initialize handlers
+    news_handler = NewsHandler(news_api_key)
+    econ_handler = EconDataHandler(eia_api_key)
+    rl_trainer = RLTrainer()
     
-    # Fetch data
-    raw_data = DataHandler.fetch_data(symbol, period, interval)
+    # Data fetching and processing
+    st.sidebar.subheader("Data Actions")
+    if st.sidebar.button("Fetch Data"):
+        with st.spinner("Fetching data..."):
+            st.session_state.raw_data = DataHandler.fetch_data(ticker, period, interval)
+            if st.session_state.raw_data is not None:
+                st.session_state.processed_data = DataHandler.add_features(st.session_state.raw_data)
+                
+                # Update news sentiment and inventory data
+                if news_api_key:
+                    sentiment = news_handler.update_news_sentiment()
+                    if 'news_sentiment' not in st.session_state.processed_data:
+                        st.session_state.processed_data['news_sentiment'] = sentiment
+                
+                if eia_api_key:
+                    inventory = econ_handler.update_inventory_data()
+                    if 'inventory_level' not in st.session_state.processed_data:
+                        st.session_state.processed_data['inventory_level'] = inventory
+                
+                st.success("Data fetched and processed successfully!")
     
     # Main tabs
-    tab1, tab2, tab3 = st.tabs(["Optimization", "Manual Backtest", "Data Exploration"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Data Explorer", "Rule-Based Strategy", "RL Strategy", "Live Trading"])
     
+    # Tab 1: Data Explorer
     with tab1:
-        st.header("Strategy Optimization")
+        st.header("Data Explorer")
         
-        if st.button("Run Optimization"):
-            if raw_data is None:
-                st.error("No data available for optimization")
-            else:
-                params = {
-                    'hours_to_test': default_hours,
-                    'vol_thresholds': vol_thresholds,
-                    'hold_hours': hold_hours,
-                    'transaction_cost': transaction_cost
-                }
+        if st.session_state.raw_data is not None:
+            st.subheader("Price Data")
+            st.line_chart(st.session_state.raw_data['Close'])
+            
+            st.subheader("Features")
+            feature_cols = ['volatility_3h', 'volatility_12h', 'volatility_ratio', 
+                           'momentum_3h', 'momentum_12h', 'news_sentiment']
+            available_features = [f for f in feature_cols if f in st.session_state.processed_data.columns]
+            st.line_chart(st.session_state.processed_data[available_features])
+            
+            st.subheader("Latest Data")
+            st.dataframe(st.session_state.processed_data.tail(10))
+            
+            # Show latest news if available
+            if news_api_key and news_handler.cached_news:
+                st.subheader("Latest News")
+                for article in news_handler.cached_news[:5]:
+                    st.markdown(f"""
+                    **{article['title']}**  
+                    *{article['source']['name']} - {article['publishedAt']}*  
+                    {article['description']}  
+                    [Read more]({article['url']})
+                    """)
+                    
+                # Show sentiment gauge
+                current_sentiment = news_handler.cached_sentiment
+                fig = go.Figure(go.Indicator(
+                    mode="gauge+number",
+                    value=current_sentiment,
+                    domain={'x': [0, 1], 'y': [0, 1]},
+                    title={'text': "Current News Sentiment"},
+                    gauge={
+                        'axis': {'range': [-1, 1]},
+                        'steps': [
+                            {'range': [-1, -0.5], 'color': "red"},
+                            {'range': [-0.5, 0], 'color': "orange"},
+                            {'range': [0, 0.5], 'color': "lightgreen"},
+                            {'range': [0.5, 1], 'color': "green"}
+                        ]
+                    }
+                ))
+                st.plotly_chart(fig, use_container_width=True)
                 
-                optimized_results = Optimizer.grid_search(raw_data, params)
-                
-                if optimized_results.empty:
-                    st.warning("No valid configurations found. Try different parameters.")
-                else:
-                    # Display top 5 results
-                    st.subheader("Top 5 Configurations")
-                    st.dataframe(optimized_results.head().style.format({
-                        'vol_thresh': '{:.3f}',
-                        'train_sharpe': '{:.2f}',
-                        'valid_sharpe': '{:.2f}',
-                        'combined_sharpe': '{:.2f}',
-                        'train_return': '{:.2%}',
-                        'valid_return': '{:.2%}'
-                    }))
-                    
-                    # Run backtest with best configuration
-                    best_config = optimized_results.iloc[0].to_dict()
-                    df = DataHandler.add_features(raw_data.copy())
-                    df = TradingStrategy.generate_signals(
-                        df, 
-                        best_config['hour'], 
-                        best_config['vol_thresh'], 
-                        best_config['hold_hours']
-                    )
-                    df, trades_df, metrics = Backtester.run_backtest(df, transaction_cost)
-                    
-                    # Display metrics
-                    st.subheader("Best Strategy Performance")
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("Total Return", f"{metrics['total_return']:.2%}")
-                    col2.metric("Annualized Return", f"{metrics['annualized_return']:.2%}")
-                    col3.metric("Max Drawdown", f"{metrics['max_drawdown']:.2%}")
-                    
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}")
-                    col2.metric("Sortino Ratio", f"{metrics['sortino_ratio']:.2f}")
-                    col3.metric("Win Rate", f"{metrics['win_rate']:.2%}")
-                    
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("Profit Factor", f"{metrics['profit_factor']:.2f}")
-                    col2.metric("Avg Trade Return", f"{metrics['avg_trade_return']:.2%}")
-                    col3.metric("Total Trades", metrics['trades'])
-                    
-                    # Visualizations
-                    st.subheader("Performance Charts")
-                    equity_fig = Visualizer.plot_equity_curve(df, best_config)
-                    if equity_fig:
-                        st.pyplot(equity_fig)
-                    
-                    dd_fig = Visualizer.plot_drawdown(df)
-                    if dd_fig:
-                        st.pyplot(dd_fig)
-                    
-                    if not trades_df.empty:
-                        st.subheader("Trade Analysis")
-                        trade_fig = Visualizer.plot_trade_analysis(trades_df)
-                        if trade_fig:
-                            st.pyplot(trade_fig)
-                        
-                        session_fig = Visualizer.plot_session_returns(trades_df)
-                        if session_fig:
-                            st.pyplot(session_fig)
-                        
-                        st.subheader("Trade Log")
-                        st.dataframe(trades_df.sort_values('entry_time', ascending=False))
+        else:
+            st.warning("No data available. Please fetch data first.")
     
+    # Tab 2: Rule-Based Strategy
     with tab2:
-        st.header("Manual Backtest")
+        st.header("Rule-Based Trading Strategy")
         
-        if raw_data is None:
-            st.error("No data available for backtesting")
+        if st.session_state.processed_data is not None:
+            if st.button("Run Backtest"):
+                with st.spinner("Running backtest..."):
+                    # Update sentiment and inventory data
+                    if news_api_key:
+                        sentiment = news_handler.update_news_sentiment()
+                        st.session_state.processed_data['news_sentiment'] = sentiment
+                    
+                    if eia_api_key:
+                        inventory = econ_handler.update_inventory_data()
+                        st.session_state.processed_data['inventory_level'] = inventory
+                    
+                    # Generate signals and run backtest
+                    signals = TradingStrategy.generate_signals(
+                        st.session_state.processed_data,
+                        vol_thresh,
+                        hold_hours,
+                        use_sentiment,
+                        sentiment_threshold
+                    )
+                    
+                    st.session_state.backtest_data = Backtester.run_backtest(signals, Config.TRANSACTION_COST)
+                    
+                    if st.session_state.backtest_data is not None:
+                        st.success("Backtest completed!")
+            
+            if st.session_state.backtest_data is not None:
+                # Display metrics
+                metrics = Backtester.calculate_metrics(st.session_state.backtest_data)
+                
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Strategy Return", f"{metrics['strategy_return']*100:.2f}%")
+                col2.metric("Benchmark Return", f"{metrics['benchmark_return']*100:.2f}%")
+                col3.metric("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}")
+                
+                col4, col5, col6 = st.columns(3)
+                col4.metric("Annualized Strategy", f"{metrics['annualized_strategy']*100:.2f}%")
+                col5.metric("Max Drawdown", f"{metrics['max_drawdown']*100:.2f}%")
+                col6.metric("Win Rate", f"{metrics['win_rate']*100:.2f}%")
+                
+                # Plot performance
+                st.subheader("Performance")
+                st.line_chart(st.session_state.backtest_data[['cumulative_return', 'benchmark_return']])
+                
+                # Plot drawdown
+                cum_returns = st.session_state.backtest_data['cumulative_return']
+                peak = cum_returns.cummax()
+                drawdown = (cum_returns - peak) / peak
+                st.subheader("Drawdown")
+                st.line_chart(drawdown)
+                
+                # Show trades
+                st.subheader("Trades")
+                trades = st.session_state.backtest_data[st.session_state.backtest_data['position'].diff() != 0]
+                st.dataframe(trades[['Close', 'position', 'volatility_3h', 'volatility_ratio']])
         else:
-            df = DataHandler.add_features(raw_data.copy())
-            df = TradingStrategy.generate_signals(df, manual_hour, manual_vol, manual_hold)
-            df, trades_df, metrics = Backtester.run_backtest(df, transaction_cost)
-            
-            # Display metrics
-            st.subheader("Strategy Performance")
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Total Return", f"{metrics['total_return']:.2%}")
-            col2.metric("Annualized Return", f"{metrics['annualized_return']:.2%}")
-            col3.metric("Max Drawdown", f"{metrics['max_drawdown']:.2%}")
-            
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}")
-            col2.metric("Sortino Ratio", f"{metrics['sortino_ratio']:.2f}")
-            col3.metric("Win Rate", f"{metrics['win_rate']:.2%}")
-            
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Profit Factor", f"{metrics['profit_factor']:.2f}")
-            col2.metric("Avg Trade Return", f"{metrics['avg_trade_return']:.2%}")
-            col3.metric("Total Trades", metrics['trades'])
-            
-            # Visualizations
-            st.subheader("Performance Charts")
-            equity_fig = Visualizer.plot_equity_curve(df, {
-                'hour': manual_hour,
-                'vol_thresh': manual_vol,
-                'hold_hours': manual_hold
-            })
-            if equity_fig:
-                st.pyplot(equity_fig)
-            
-            dd_fig = Visualizer.plot_drawdown(df)
-            if dd_fig:
-                st.pyplot(dd_fig)
-            
-            if not trades_df.empty:
-                st.subheader("Trade Analysis")
-                trade_fig = Visualizer.plot_trade_analysis(trades_df)
-                if trade_fig:
-                    st.pyplot(trade_fig)
-                
-                session_fig = Visualizer.plot_session_returns(trades_df)
-                if session_fig:
-                    st.pyplot(session_fig)
-                
-                st.subheader("Trade Log")
-                st.dataframe(trades_df.sort_values('entry_time', ascending=False))
+            st.warning("No processed data available. Please fetch data first.")
     
+    # Tab 3: RL Strategy
     with tab3:
-        st.header("Data Exploration")
+        st.header("Reinforcement Learning Strategy")
         
-        if raw_data is None:
-            st.error("No data available for exploration")
+        if st.session_state.processed_data is not None:
+            st.subheader("RL Training")
+            
+            col1, col2 = st.columns(2)
+            algorithm = col1.selectbox("Algorithm", ['DQN', 'PPO'], index=0)
+            timesteps = col2.number_input("Training Timesteps", min_value=1000, max_value=100000, value=10000, step=1000)
+            
+            if st.button("Train RL Agent"):
+                with st.spinner("Training RL agent..."):
+                    # Update sentiment and inventory data
+                    if news_api_key:
+                        sentiment = news_handler.update_news_sentiment()
+                        st.session_state.processed_data['news_sentiment'] = sentiment
+                    
+                    if eia_api_key:
+                        inventory = econ_handler.update_inventory_data()
+                        st.session_state.processed_data['inventory_level'] = inventory
+                    
+                    # Train model
+                    st.session_state.rl_model = rl_trainer.train_model(
+                        st.session_state.processed_data,
+                        timesteps,
+                        algorithm
+                    )
+                    
+                    # Evaluate model
+                    if st.session_state.rl_model is not None:
+                        st.session_state.rl_results = rl_trainer.evaluate_model(
+                            st.session_state.rl_model,
+                            st.session_state.processed_data
+                        )
+                        st.success("Training completed!")
+            
+            # Show training progress
+            if rl_trainer.training:
+                st.progress(rl_trainer.progress)
+                st.write(f"Training in progress... {rl_trainer.progress}% complete")
+            
+            # Show results
+            if st.session_state.rl_results is not None:
+                st.subheader("RL Strategy Performance")
+                
+                col1, col2 = st.columns(2)
+                col1.metric("Final Balance", f"${st.session_state.rl_results['final_balance']:,.2f}")
+                col2.metric("Total Return", f"{st.session_state.rl_results['return']*100:.2f}%")
+                
+                # Plot portfolio value
+                st.subheader("Portfolio Value")
+                st.line_chart(pd.Series(st.session_state.rl_results['portfolio']))
+                
+                # Show trades
+                if st.session_state.rl_results['trades']:
+                    st.subheader("RL Trades")
+                    trades_df = pd.DataFrame(st.session_state.rl_results['trades'])
+                    st.dataframe(trades_df)
+                else:
+                    st.info("No trades were executed by the RL agent.")
         else:
-            df = DataHandler.add_features(raw_data.copy())
-            
-            st.subheader("Raw Data")
-            st.dataframe(df.tail())
-            
-            st.subheader("Descriptive Statistics")
-            st.dataframe(df.describe())
-            
-            st.subheader("Hourly Returns Analysis")
-            hourly_stats = df.groupby('hour')['return'].agg(['mean', 'std', 'count'])
-            st.dataframe(hourly_stats.style.format({
-                'mean': '{:.2%}',
-                'std': '{:.2%}'
-            }))
-            
-            fig, ax = plt.subplots(figsize=(12, 6))
-            sns.boxplot(x='hour', y='return', data=df, ax=ax)
-            ax.set_title('Return Distribution by Hour (UTC)')
-            ax.set_ylabel('Return')
-            ax.set_xlabel('Hour (UTC)')
-            st.pyplot(fig)
-            
-            st.subheader("Volatility Analysis")
-            fig, ax = plt.subplots(figsize=(12, 6))
-            df['volatility_3h'].plot(ax=ax)
-            ax.set_title('3-Hour Rolling Volatility')
-            ax.set_ylabel('Volatility')
-            st.pyplot(fig)
+            st.warning("No processed data available. Please fetch data first.")
+    
+    # Tab 4: Live Trading
+    with tab4:
+        st.header("Live Trading Simulation")
+        st.warning("This feature is under development and will be implemented in a future update.")
+        st.info("""
+        Planned features:
+        - Real-time data streaming
+        - Live trade execution
+        - Performance monitoring
+        - Risk management controls
+        """)
 
 if __name__ == "__main__":
     main()
