@@ -101,8 +101,14 @@ col3.metric("💰 Profit Factor", f"{profit_factor:.2f}")
 
 # === CHARTS ===
 st.subheader("📉 Strategy vs. Buy & Hold")
-st.line_chart(df[['cumulative_return', 'buy_hold']])
+try:
+    st.line_chart(df[['cumulative_return', 'buy_hold']])
+except KeyError:
+    st.warning("Chart data missing. Check strategy setup or data availability.")
 
 # === TRADE LOG ===
 st.subheader("📋 Sample Trades")
-st.dataframe(trades_df.head(10))
+if not trades_df.empty:
+    st.dataframe(trades_df.head(10))
+else:
+    st.info("No trades triggered for this config. Try adjusting thresholds or hours.")
