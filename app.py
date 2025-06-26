@@ -169,7 +169,7 @@ class TradingStrategy:
             (df['hour'] == target_hour) & 
             (df['volatility_3h'] > vol_thresh) & 
             (df['volatility_ratio'] > 0.7
-        )
+        ))
         
         # Optional sentiment filter
         if use_sentiment and 'news_sentiment' in df:
