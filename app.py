@@ -86,3 +86,26 @@ if not trades_df.empty:
     st.dataframe(trades_df.head())
 else:
     st.warning("No trades found for selected configuration.")
+
+# === PERFORMANCE METRICS ===
+st.subheader("📊 Performance Metrics")
+
+if not trades_df.empty:
+    total_return = df['cumulative_return'].iloc[-1] - 1
+    annualized_return = (1 + total_return) ** (365 / (len(df) / 24)) - 1
+    strategy_returns = df['strategy_return'].dropna()
+    sharpe_ratio = strategy_returns.mean() / strategy_returns.std() * np.sqrt(24) if strategy_returns.std() > 0 else 0
+
+    max_drawdown = ((df['cumulative_return'] / df['cumulative_return'].cummax()) - 1).min()
+    win_rate = (trades_df['return'] > 0).mean()
+    profit_factor = trades_df[trades_df['return'] > 0]['return'].sum() / abs(trades_df[trades_df['return'] < 0]['return'].sum()) \
+        if not trades_df[trades_df['return'] < 0].empty else np.inf
+
+    st.metric("📈 Total Return", f"{total_return:.2%}")
+    st.metric("⏱ Annualized Return", f"{annualized_return:.2%}")
+    st.metric("📊 Sharpe Ratio", f"{sharpe_ratio:.2f}")
+    st.metric("✅ Win Rate", f"{win_rate:.2%}")
+    st.metric("📉 Max Drawdown", f"{max_drawdown:.2%}")
+    st.metric("💰 Profit Factor", f"{profit_factor:.2f}")
+else:
+    st.warning("No trades to calculate metrics.")
