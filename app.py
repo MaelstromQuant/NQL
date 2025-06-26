@@ -6,8 +6,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Streamlit setup
-st.set_page_config(page_title="Noetherra Quant Lab", layout="wide")
-st.title("🧪 Noetherra Strategies Quant Lab")
+st.set_page_config(page_title="NQL", layout="wide")
+st.title("🧪 nql")
 st.markdown("Backtest & visualize volatility-based strategies on hourly oil data.")
 
 # Sidebar config
