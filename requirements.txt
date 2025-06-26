@@ -3,6 +3,10 @@ yfinance
 pandas
 numpy
 matplotlib
-seaborn
+requests
+plotly
 scipy
-vaderSentiment 
+vaderSentiment
+stable-baselines3
+gym
+torch
