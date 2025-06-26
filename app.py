@@ -7,7 +7,6 @@ import yfinance as yf
 from datetime import datetime, timedelta
 
 st.set_page_config(page_title="NQL – Quant Lab", layout="wide")
-
 st.title("📈 NQL – Quant Strategy Lab")
 st.markdown("Backtest hourly volatility-based strategies on oil futures (WTI, Brent, etc.).")
 
@@ -75,7 +74,11 @@ def get_trade_log(df):
             open_trade['return'] = (open_trade['exit_price'] - open_trade['entry_price']) / open_trade['entry_price']
             trades.append(open_trade)
             open_trade = None
-    return pd.DataFrame(trades)
+    trades_df = pd.DataFrame(trades)
+    # Ensure numeric return
+    trades_df['return'] = pd.to_numeric(trades_df['return'], errors='coerce')
+    trades_df.dropna(subset=['return'], inplace=True)
+    return trades_df
 
 # === STRATEGY EXECUTION ===
 df = generate_strategy(data.copy(), entry_hour, vol_thresh, hold_hours)
