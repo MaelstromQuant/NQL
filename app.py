@@ -19,26 +19,28 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Add custom CSS directly instead of loading from file
+# Custom CSS styling
 def set_css():
     st.markdown("""
     <style>
-        /* Main menu */
-        .st-eb {
-            background-color: #f0f2f6 !important;
+        /* Main container */
+        .main {
+            background-color: #f8f9fa;
         }
         
         /* Sidebar */
         .css-1d391kg {
-            background-color: #f8f9fa !important;
+            background-color: #e9ecef;
+            padding: 1rem;
+            border-radius: 0.5rem;
         }
         
-        /* Metrics */
+        /* Metrics cards */
         .st-bh, .st-cg, .st-ci {
-            background-color: #ffffff !important;
-            border-radius: 8px;
-            padding: 15px !important;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            background-color: white;
+            border-radius: 0.5rem;
+            padding: 1rem;
+            box-shadow: 0 0.125rem 0.25rem rgba(0,0,0,0.1);
         }
         
         /* Titles */
@@ -48,13 +50,21 @@ def set_css():
         
         /* Dataframes */
         .dataframe {
-            border-radius: 8px;
+            border-radius: 0.5rem;
+            box-shadow: 0 0.125rem 0.25rem rgba(0,0,0,0.1);
+        }
+        
+        /* Buttons */
+        .stButton>button {
+            background-color: #4a6bdf;
+            color: white;
+            border-radius: 0.5rem;
+            padding: 0.5rem 1rem;
         }
     </style>
     """, unsafe_allow_html=True)
 
 set_css()
-
 
 # === CONFIGURATION ===
 class Config:
@@ -94,6 +104,9 @@ class DataHandler:
     @staticmethod
     def add_features(df):
         """Enhanced feature engineering"""
+        if df is None or df.empty:
+            return None
+            
         df = df.copy()
         
         # Basic features
@@ -104,7 +117,7 @@ class DataHandler:
         # Volatility measures
         df['volatility_3h'] = df['Close'].rolling(window=3).std()
         df['volatility_12h'] = df['Close'].rolling(window=12).std()
-        df['volatility_ratio'] = df['volatility_3h'] / df['volatility_12h']
+        df['volatility_ratio'] = df['volatility_3h'] / df['volatility_12h'].replace(0, np.nan)
         
         # Momentum indicators
         df['momentum_3h'] = df['Close'].pct_change(3)
@@ -118,7 +131,12 @@ class DataHandler:
     @staticmethod
     def label_sessions(df):
         """Label trading sessions with overlap handling"""
+        if df is None or df.empty:
+            return None
+            
+        df = df.copy()
         df['session'] = 'Other'
+        
         for name, hours in Config.SESSION_RANGES.items():
             mask = df['hour'].isin(hours)
             df.loc[mask, 'session'] = name
@@ -134,6 +152,9 @@ class TradingStrategy:
     @staticmethod
     def generate_signals(df, target_hour, vol_thresh, hold_hours):
         """Enhanced signal generation with multiple conditions"""
+        if df is None or df.empty:
+            return None
+            
         df = df.copy()
         
         # Initialize signals
@@ -169,6 +190,19 @@ class Backtester:
     @staticmethod
     def run_backtest(df, transaction_cost):
         """Comprehensive backtesting with enhanced metrics"""
+        if df is None or df.empty:
+            return None, pd.DataFrame(), {
+                'total_return': 0,
+                'annualized_return': 0,
+                'sharpe_ratio': 0,
+                'sortino_ratio': 0,
+                'max_drawdown': 0,
+                'win_rate': 0,
+                'profit_factor': 0,
+                'avg_trade_return': 0,
+                'trades': 0
+            }
+            
         df = df.copy()
         
         # Calculate strategy returns
@@ -190,7 +224,10 @@ class Backtester:
 
     @staticmethod
     def _log_trades(df):
-        """Detailed trade logging"""
+        """Detailed trade logging with robust return calculation"""
+        if df is None or df.empty:
+            return []
+            
         trades = []
         open_trade = None
         
@@ -205,23 +242,36 @@ class Backtester:
                 }
             # Exit
             elif df['position'].iloc[i-1] == 1 and df['position'].iloc[i] == 0 and open_trade:
-                open_trade.update({
-                    'exit_time': df.index[i],
-                    'exit_price': df['Close'].iloc[i],
-                    'exit_session': df['session'].iloc[i],
-                    'holding_period': (df.index[i] - open_trade['entry_time']).total_seconds() / 3600,
-                    'return': (df['Close'].iloc[i] - open_trade['entry_price']) / open_trade['entry_price'],
-                    'return_net': (df['Close'].iloc[i] - open_trade['entry_price']) / open_trade['entry_price'] - 2*Config.DEFAULT_TRANSACTION_COST
-                })
-                trades.append(open_trade)
-                open_trade = None
+                try:
+                    entry_price = float(open_trade['entry_price'])
+                    exit_price = float(df['Close'].iloc[i])
+                    
+                    if entry_price == 0:
+                        continue  # Skip invalid trades
+                        
+                    raw_return = (exit_price - entry_price) / entry_price
+                    net_return = raw_return - 2*Config.DEFAULT_TRANSACTION_COST
+                    
+                    open_trade.update({
+                        'exit_time': df.index[i],
+                        'exit_price': exit_price,
+                        'exit_session': df['session'].iloc[i],
+                        'holding_period': (df.index[i] - open_trade['entry_time']).total_seconds() / 3600,
+                        'return': raw_return,
+                        'return_net': net_return if not np.isnan(net_return) else 0.0
+                    })
+                    trades.append(open_trade)
+                except (TypeError, ValueError, KeyError):
+                    continue
+                finally:
+                    open_trade = None
         
         return trades
 
     @staticmethod
     def _calculate_metrics(df, trades_df, transaction_cost):
-        """Enhanced performance metrics"""
-        if len(trades_df) == 0:
+        """Enhanced performance metrics with robust error handling"""
+        if df is None or df.empty or len(trades_df) == 0:
             return {
                 'total_return': 0,
                 'annualized_return': 0,
@@ -233,47 +283,71 @@ class Backtester:
                 'avg_trade_return': 0,
                 'trades': 0
             }
-        
-        # Basic metrics
-        total_return = df['cumulative_return'].iloc[-1] - 1
-        annualized_return = (1 + total_return) ** (365/(len(df)/24)) - 1
-        
-        # Risk-adjusted metrics
-        excess_returns = df['strategy_return'] - Config.RISK_FREE_RATE/24
-        sharpe = excess_returns.mean() / excess_returns.std() * np.sqrt(24)
-        
-        downside_returns = excess_returns[excess_returns < 0]
-        sortino = excess_returns.mean() / downside_returns.std() * np.sqrt(24) if len(downside_returns) > 0 else 0
-        
-        # Drawdown
-        cum_returns = df['cumulative_return']
-        max_dd = (cum_returns / cum_returns.cummax() - 1).min()
-        
-        # Trade metrics
-        win_rate = len(trades_df[trades_df['return_net'] > 0]) / len(trades_df) if len(trades_df) > 0 else 0
-        profit_factor = trades_df[trades_df['return_net'] > 0]['return_net'].sum() / \
-                       abs(trades_df[trades_df['return_net'] < 0]['return_net'].sum()) if \
-                       len(trades_df[trades_df['return_net'] < 0]) > 0 else np.inf
-        avg_trade_return = trades_df['return_net'].mean() if len(trades_df) > 0 else 0
-        
-        return {
-            'total_return': total_return,
-            'annualized_return': annualized_return,
-            'sharpe_ratio': sharpe,
-            'sortino_ratio': sortino,
-            'max_drawdown': max_dd,
-            'win_rate': win_rate,
-            'profit_factor': profit_factor,
-            'avg_trade_return': avg_trade_return,
-            'trades': len(trades_df)
-        }
+            
+        try:
+            # Basic metrics
+            total_return = float(df['cumulative_return'].iloc[-1]) - 1
+            annualized_return = (1 + total_return) ** (365/(len(df)/24)) - 1
+            
+            # Risk-adjusted metrics
+            excess_returns = df['strategy_return'] - Config.RISK_FREE_RATE/24
+            excess_returns = excess_returns.replace([np.inf, -np.inf], np.nan).dropna()
+            
+            if len(excess_returns) == 0:
+                sharpe = 0
+            else:
+                sharpe = excess_returns.mean() / excess_returns.std() * np.sqrt(24) if excess_returns.std() != 0 else 0
+            
+            downside_returns = excess_returns[excess_returns < 0]
+            sortino = excess_returns.mean() / downside_returns.std() * np.sqrt(24) if len(downside_returns) > 0 else 0
+            
+            # Drawdown
+            cum_returns = df['cumulative_return']
+            max_dd = (cum_returns / cum_returns.cummax() - 1).min()
+            
+            # Trade metrics
+            valid_returns = trades_df['return_net'].replace([np.inf, -np.inf], np.nan).dropna()
+            winning_trades = valid_returns[valid_returns > 0]
+            losing_trades = valid_returns[valid_returns < 0]
+            
+            win_rate = len(winning_trades) / len(valid_returns) if len(valid_returns) > 0 else 0
+            profit_factor = winning_trades.sum() / abs(losing_trades.sum()) if len(losing_trades) > 0 else np.inf
+            avg_trade_return = valid_returns.mean() if len(valid_returns) > 0 else 0
+            
+            return {
+                'total_return': total_return,
+                'annualized_return': annualized_return,
+                'sharpe_ratio': sharpe,
+                'sortino_ratio': sortino,
+                'max_drawdown': max_dd,
+                'win_rate': win_rate,
+                'profit_factor': profit_factor,
+                'avg_trade_return': avg_trade_return,
+                'trades': len(trades_df)
+            }
+        except Exception as e:
+            st.error(f"Error calculating metrics: {str(e)}")
+            return {
+                'total_return': 0,
+                'annualized_return': 0,
+                'sharpe_ratio': 0,
+                'sortino_ratio': 0,
+                'max_drawdown': 0,
+                'win_rate': 0,
+                'profit_factor': 0,
+                'avg_trade_return': 0,
+                'trades': 0
+            }
 
 # === OPTIMIZATION ===
 class Optimizer:
     @staticmethod
     def grid_search(raw_data, params):
         """Perform parameter optimization with walk-forward validation"""
-        with st.spinner('Running optimization...'):
+        if raw_data is None or raw_data.empty:
+            return pd.DataFrame()
+            
+        try:
             results = []
             
             # Split data into training and validation sets
@@ -294,7 +368,13 @@ class Optimizer:
                 for vol in param_grid['vol_thresh']:
                     for hold in param_grid['hold_hours']:
                         df = DataHandler.add_features(train_data.copy())
+                        if df is None:
+                            continue
+                            
                         df = TradingStrategy.generate_signals(df, hour, vol, hold)
+                        if df is None:
+                            continue
+                            
                         _, _, metrics = Backtester.run_backtest(df, params['transaction_cost'])
                         
                         train_results.append({
@@ -307,12 +387,21 @@ class Optimizer:
             
             # Get top N configurations from training
             train_df = pd.DataFrame(train_results)
+            if train_df.empty:
+                return pd.DataFrame()
+                
             top_configs = train_df.sort_values('train_sharpe', ascending=False).head(10)
             
             # Validate top configurations
             for _, config in top_configs.iterrows():
                 df = DataHandler.add_features(valid_data.copy())
+                if df is None:
+                    continue
+                    
                 df = TradingStrategy.generate_signals(df, config['hour'], config['vol_thresh'], config['hold_hours'])
+                if df is None:
+                    continue
+                    
                 _, _, metrics = Backtester.run_backtest(df, params['transaction_cost'])
                 
                 results.append({
@@ -328,12 +417,19 @@ class Optimizer:
             
             results_df = pd.DataFrame(results)
             return results_df.sort_values('combined_sharpe', ascending=False)
+            
+        except Exception as e:
+            st.error(f"Error during optimization: {str(e)}")
+            return pd.DataFrame()
 
 # === VISUALIZATION ===
 class Visualizer:
     @staticmethod
     def plot_equity_curve(df, config):
         """Plot equity curve with annotations"""
+        if df is None or df.empty:
+            return None
+            
         fig, ax = plt.subplots(figsize=(12, 6))
         
         # Plot equity curves
@@ -357,6 +453,9 @@ class Visualizer:
     @staticmethod
     def plot_drawdown(df):
         """Plot drawdown curve"""
+        if df is None or df.empty:
+            return None
+            
         fig, ax = plt.subplots(figsize=(12, 4))
         
         # Calculate drawdown
@@ -378,13 +477,14 @@ class Visualizer:
     @staticmethod
     def plot_trade_analysis(trades_df):
         """Plot trade-level analysis"""
-        if trades_df.empty:
+        if trades_df is None or trades_df.empty:
             return None
             
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
         
         # Trade returns distribution
-        sns.histplot(trades_df['return_net'], bins=30, kde=True, ax=ax1)
+        sns.histplot(trades_df['return_net'].replace([np.inf, -np.inf], np.nan).dropna(), 
+                    bins=30, kde=True, ax=ax1)
         ax1.set_title('Distribution of Trade Returns', fontsize=14)
         ax1.set_xlabel('Return', fontsize=12)
         ax1.grid(True, linestyle='--', alpha=0.7)
@@ -404,12 +504,14 @@ class Visualizer:
     @staticmethod
     def plot_session_returns(trades_df):
         """Plot returns by trading session"""
-        if trades_df.empty:
+        if trades_df is None or trades_df.empty:
             return None
             
         fig, ax = plt.subplots(figsize=(10, 6))
         
-        session_returns = trades_df.groupby('entry_session')['return_net'].mean().sort_values()
+        session_returns = trades_df.groupby('entry_session')['return_net'] \
+                                 .mean() \
+                                 .sort_values()
         session_returns.plot(kind='barh', color='green', alpha=0.6, ax=ax)
         
         ax.set_title('Average Returns by Trading Session', fontsize=14)
@@ -476,9 +578,6 @@ def main():
     
     # Fetch data
     raw_data = DataHandler.fetch_data(symbol, period, interval)
-    if raw_data is None:
-        st.error("Failed to fetch data. Please check your inputs.")
-        return
     
     # Main tabs
     tab1, tab2, tab3 = st.tabs(["Optimization", "Manual Backtest", "Data Exploration"])
@@ -487,142 +586,171 @@ def main():
         st.header("Strategy Optimization")
         
         if st.button("Run Optimization"):
-            params = {
-                'hours_to_test': default_hours,
-                'vol_thresholds': vol_thresholds,
-                'hold_hours': hold_hours,
-                'transaction_cost': transaction_cost
-            }
-            
-            optimized_results = Optimizer.grid_search(raw_data, params)
-            
-            if optimized_results.empty:
-                st.warning("No valid configurations found. Try different parameters.")
+            if raw_data is None:
+                st.error("No data available for optimization")
             else:
-                # Display top 5 results
-                st.subheader("Top 5 Configurations")
-                st.dataframe(optimized_results.head().style.format({
-                    'vol_thresh': '{:.3f}',
-                    'train_sharpe': '{:.2f}',
-                    'valid_sharpe': '{:.2f}',
-                    'combined_sharpe': '{:.2f}',
-                    'train_return': '{:.2%}',
-                    'valid_return': '{:.2%}'
-                }))
+                params = {
+                    'hours_to_test': default_hours,
+                    'vol_thresholds': vol_thresholds,
+                    'hold_hours': hold_hours,
+                    'transaction_cost': transaction_cost
+                }
                 
-                # Run backtest with best configuration
-                best_config = optimized_results.iloc[0].to_dict()
-                df = DataHandler.add_features(raw_data.copy())
-                df = TradingStrategy.generate_signals(
-                    df, 
-                    best_config['hour'], 
-                    best_config['vol_thresh'], 
-                    best_config['hold_hours']
-                )
-                df, trades_df, metrics = Backtester.run_backtest(df, transaction_cost)
+                optimized_results = Optimizer.grid_search(raw_data, params)
                 
-                # Display metrics
-                st.subheader("Best Strategy Performance")
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Total Return", f"{metrics['total_return']:.2%}")
-                col2.metric("Annualized Return", f"{metrics['annualized_return']:.2%}")
-                col3.metric("Max Drawdown", f"{metrics['max_drawdown']:.2%}")
-                
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}")
-                col2.metric("Sortino Ratio", f"{metrics['sortino_ratio']:.2f}")
-                col3.metric("Win Rate", f"{metrics['win_rate']:.2%}")
-                
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Profit Factor", f"{metrics['profit_factor']:.2f}")
-                col2.metric("Avg Trade Return", f"{metrics['avg_trade_return']:.2%}")
-                col3.metric("Total Trades", metrics['trades'])
-                
-                # Visualizations
-                st.subheader("Performance Charts")
-                st.pyplot(Visualizer.plot_equity_curve(df, best_config))
-                st.pyplot(Visualizer.plot_drawdown(df))
-                
-                if not trades_df.empty:
-                    st.subheader("Trade Analysis")
-                    st.pyplot(Visualizer.plot_trade_analysis(trades_df))
-                    st.pyplot(Visualizer.plot_session_returns(trades_df))
+                if optimized_results.empty:
+                    st.warning("No valid configurations found. Try different parameters.")
+                else:
+                    # Display top 5 results
+                    st.subheader("Top 5 Configurations")
+                    st.dataframe(optimized_results.head().style.format({
+                        'vol_thresh': '{:.3f}',
+                        'train_sharpe': '{:.2f}',
+                        'valid_sharpe': '{:.2f}',
+                        'combined_sharpe': '{:.2f}',
+                        'train_return': '{:.2%}',
+                        'valid_return': '{:.2%}'
+                    }))
                     
-                    st.subheader("Trade Log")
-                    st.dataframe(trades_df.sort_values('entry_time', ascending=False))
+                    # Run backtest with best configuration
+                    best_config = optimized_results.iloc[0].to_dict()
+                    df = DataHandler.add_features(raw_data.copy())
+                    df = TradingStrategy.generate_signals(
+                        df, 
+                        best_config['hour'], 
+                        best_config['vol_thresh'], 
+                        best_config['hold_hours']
+                    )
+                    df, trades_df, metrics = Backtester.run_backtest(df, transaction_cost)
+                    
+                    # Display metrics
+                    st.subheader("Best Strategy Performance")
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Total Return", f"{metrics['total_return']:.2%}")
+                    col2.metric("Annualized Return", f"{metrics['annualized_return']:.2%}")
+                    col3.metric("Max Drawdown", f"{metrics['max_drawdown']:.2%}")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}")
+                    col2.metric("Sortino Ratio", f"{metrics['sortino_ratio']:.2f}")
+                    col3.metric("Win Rate", f"{metrics['win_rate']:.2%}")
+                    
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Profit Factor", f"{metrics['profit_factor']:.2f}")
+                    col2.metric("Avg Trade Return", f"{metrics['avg_trade_return']:.2%}")
+                    col3.metric("Total Trades", metrics['trades'])
+                    
+                    # Visualizations
+                    st.subheader("Performance Charts")
+                    equity_fig = Visualizer.plot_equity_curve(df, best_config)
+                    if equity_fig:
+                        st.pyplot(equity_fig)
+                    
+                    dd_fig = Visualizer.plot_drawdown(df)
+                    if dd_fig:
+                        st.pyplot(dd_fig)
+                    
+                    if not trades_df.empty:
+                        st.subheader("Trade Analysis")
+                        trade_fig = Visualizer.plot_trade_analysis(trades_df)
+                        if trade_fig:
+                            st.pyplot(trade_fig)
+                        
+                        session_fig = Visualizer.plot_session_returns(trades_df)
+                        if session_fig:
+                            st.pyplot(session_fig)
+                        
+                        st.subheader("Trade Log")
+                        st.dataframe(trades_df.sort_values('entry_time', ascending=False))
     
     with tab2:
         st.header("Manual Backtest")
         
-        df = DataHandler.add_features(raw_data.copy())
-        df = TradingStrategy.generate_signals(df, manual_hour, manual_vol, manual_hold)
-        df, trades_df, metrics = Backtester.run_backtest(df, transaction_cost)
-        
-        # Display metrics
-        st.subheader("Strategy Performance")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Return", f"{metrics['total_return']:.2%}")
-        col2.metric("Annualized Return", f"{metrics['annualized_return']:.2%}")
-        col3.metric("Max Drawdown", f"{metrics['max_drawdown']:.2%}")
-        
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}")
-        col2.metric("Sortino Ratio", f"{metrics['sortino_ratio']:.2f}")
-        col3.metric("Win Rate", f"{metrics['win_rate']:.2%}")
-        
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Profit Factor", f"{metrics['profit_factor']:.2f}")
-        col2.metric("Avg Trade Return", f"{metrics['avg_trade_return']:.2%}")
-        col3.metric("Total Trades", metrics['trades'])
-        
-        # Visualizations
-        st.subheader("Performance Charts")
-        st.pyplot(Visualizer.plot_equity_curve(df, {
-            'hour': manual_hour,
-            'vol_thresh': manual_vol,
-            'hold_hours': manual_hold
-        }))
-        st.pyplot(Visualizer.plot_drawdown(df))
-        
-        if not trades_df.empty:
-            st.subheader("Trade Analysis")
-            st.pyplot(Visualizer.plot_trade_analysis(trades_df))
-            st.pyplot(Visualizer.plot_session_returns(trades_df))
+        if raw_data is None:
+            st.error("No data available for backtesting")
+        else:
+            df = DataHandler.add_features(raw_data.copy())
+            df = TradingStrategy.generate_signals(df, manual_hour, manual_vol, manual_hold)
+            df, trades_df, metrics = Backtester.run_backtest(df, transaction_cost)
             
-            st.subheader("Trade Log")
-            st.dataframe(trades_df.sort_values('entry_time', ascending=False))
+            # Display metrics
+            st.subheader("Strategy Performance")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total Return", f"{metrics['total_return']:.2%}")
+            col2.metric("Annualized Return", f"{metrics['annualized_return']:.2%}")
+            col3.metric("Max Drawdown", f"{metrics['max_drawdown']:.2%}")
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Sharpe Ratio", f"{metrics['sharpe_ratio']:.2f}")
+            col2.metric("Sortino Ratio", f"{metrics['sortino_ratio']:.2f}")
+            col3.metric("Win Rate", f"{metrics['win_rate']:.2%}")
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Profit Factor", f"{metrics['profit_factor']:.2f}")
+            col2.metric("Avg Trade Return", f"{metrics['avg_trade_return']:.2%}")
+            col3.metric("Total Trades", metrics['trades'])
+            
+            # Visualizations
+            st.subheader("Performance Charts")
+            equity_fig = Visualizer.plot_equity_curve(df, {
+                'hour': manual_hour,
+                'vol_thresh': manual_vol,
+                'hold_hours': manual_hold
+            })
+            if equity_fig:
+                st.pyplot(equity_fig)
+            
+            dd_fig = Visualizer.plot_drawdown(df)
+            if dd_fig:
+                st.pyplot(dd_fig)
+            
+            if not trades_df.empty:
+                st.subheader("Trade Analysis")
+                trade_fig = Visualizer.plot_trade_analysis(trades_df)
+                if trade_fig:
+                    st.pyplot(trade_fig)
+                
+                session_fig = Visualizer.plot_session_returns(trades_df)
+                if session_fig:
+                    st.pyplot(session_fig)
+                
+                st.subheader("Trade Log")
+                st.dataframe(trades_df.sort_values('entry_time', ascending=False))
     
     with tab3:
         st.header("Data Exploration")
         
-        df = DataHandler.add_features(raw_data.copy())
-        
-        st.subheader("Raw Data")
-        st.dataframe(df.tail())
-        
-        st.subheader("Descriptive Statistics")
-        st.dataframe(df.describe())
-        
-        st.subheader("Hourly Returns Analysis")
-        hourly_stats = df.groupby('hour')['return'].agg(['mean', 'std', 'count'])
-        st.dataframe(hourly_stats.style.format({
-            'mean': '{:.2%}',
-            'std': '{:.2%}'
-        }))
-        
-        fig, ax = plt.subplots(figsize=(12, 6))
-        sns.boxplot(x='hour', y='return', data=df, ax=ax)
-        ax.set_title('Return Distribution by Hour (UTC)')
-        ax.set_ylabel('Return')
-        ax.set_xlabel('Hour (UTC)')
-        st.pyplot(fig)
-        
-        st.subheader("Volatility Analysis")
-        fig, ax = plt.subplots(figsize=(12, 6))
-        df['volatility_3h'].plot(ax=ax)
-        ax.set_title('3-Hour Rolling Volatility')
-        ax.set_ylabel('Volatility')
-        st.pyplot(fig)
+        if raw_data is None:
+            st.error("No data available for exploration")
+        else:
+            df = DataHandler.add_features(raw_data.copy())
+            
+            st.subheader("Raw Data")
+            st.dataframe(df.tail())
+            
+            st.subheader("Descriptive Statistics")
+            st.dataframe(df.describe())
+            
+            st.subheader("Hourly Returns Analysis")
+            hourly_stats = df.groupby('hour')['return'].agg(['mean', 'std', 'count'])
+            st.dataframe(hourly_stats.style.format({
+                'mean': '{:.2%}',
+                'std': '{:.2%}'
+            }))
+            
+            fig, ax = plt.subplots(figsize=(12, 6))
+            sns.boxplot(x='hour', y='return', data=df, ax=ax)
+            ax.set_title('Return Distribution by Hour (UTC)')
+            ax.set_ylabel('Return')
+            ax.set_xlabel('Hour (UTC)')
+            st.pyplot(fig)
+            
+            st.subheader("Volatility Analysis")
+            fig, ax = plt.subplots(figsize=(12, 6))
+            df['volatility_3h'].plot(ax=ax)
+            ax.set_title('3-Hour Rolling Volatility')
+            ax.set_ylabel('Volatility')
+            st.pyplot(fig)
 
 if __name__ == "__main__":
     main()
