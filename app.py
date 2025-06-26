@@ -5,7 +5,7 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="Noetherra Quant Lab", layout="wide")
-st.title("🧪 Noetherra Strategies Quant Lab")
+st.title("🧪 NLSQL")
 st.markdown("Backtest & visualize volatility-based strategies on hourly oil data.")
 
 # === Sidebar Settings ===
